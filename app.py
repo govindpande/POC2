@@ -1,13 +1,8 @@
-# app.py
 # Streamlit + browser-use job application copilot
-# Setup:
-#   python -m venv .venv && source .venv/bin/activate
-#   pip install streamlit browser-use playwright pydantic
-#   python -m playwright install
-# Run:
-#   streamlit run app.py
+# Run: streamlit run app.py
 
 import asyncio
+import importlib
 import json
 import os
 import re
@@ -16,19 +11,53 @@ from typing import List, Optional
 import streamlit as st
 from pydantic import BaseModel, Field, HttpUrl, ValidationError
 
-# ---- browser-use imports (stable across versions) ----
+# ===== browser-use core =====
 from browser_use import Agent
-from browser_use.llm.openai import OpenAIChat
 from browser_use.browser.context import BrowserContextConfig
 
-# Controller import path moved across versions; try both.
+# Controller path moved across versions; try both.
 try:
-    from browser_use.controller.service import Controller
+    from browser_use.controller.service import Controller  # newer
 except Exception:  # pragma: no cover
-    from browser_use.controller.controller import Controller  # older releases
+    from browser_use.controller.controller import Controller  # older
+
+# ---------- LLM loader (handles multiple browser-use versions) ----------
+def load_openai_driver(api_key: str, model: str, temperature: float = 0.2):
+    """
+    Try several known locations for the OpenAI driver in browser-use.
+    Returns an instance usable as `llm` for Agent(...).
+    """
+    candidates = [
+        ("browser_use.llm.openai", "OpenAIChat"),                 # many versions
+        ("browser_use.llm.providers.openai", "OpenAIChat"),       # some versions
+        ("browser_use.llm.openai_llm", "OpenAIChat"),             # older snapshots
+        ("browser_use.llm", "OpenAIChat"),                        # catch-all attempt
+        ("browser_use.llm.openai", "OpenAI"),                     # some variants export OpenAI
+    ]
+
+    for module_path, class_name in candidates:
+        try:
+            mod = importlib.import_module(module_path)
+            klass = getattr(mod, class_name)
+            return klass(api_key=api_key, model=model, temperature=temperature)
+        except Exception:
+            continue
+
+    # If none of the imports worked, raise a clear message with guidance.
+    raise ImportError(
+        "Could not import an OpenAI LLM driver from browser-use. "
+        "Install a compatible extra and try again:\n\n"
+        "  pip install 'browser-use[openai]'\n\n"
+        "If you still see this, run:\n"
+        "  python -c \"import browser_use, pkgutil; import os, inspect; "
+        "print('browser_use @', os.path.dirname(inspect.getfile(browser_use))); "
+        "import importlib; print('llm submodules:', "
+        "[m.name for m in pkgutil.iter_modules([os.path.join(os.path.dirname(inspect.getfile(browser_use)),'llm')])])\"\n"
+        "…and share the output."
+    )
+
 
 URL_REGEX = r"(https?://[^\s]+)"
-
 
 # ---------------- Models ----------------
 class Profile(BaseModel):
@@ -96,7 +125,7 @@ RETURN STRUCTURED OUTPUT ONLY as JSON:
 
 async def run_browser_use(goal: str, api_key: str, model: str, headless: bool, max_steps: int):
     """Run a browser-use Agent and return its final text output."""
-    llm = OpenAIChat(api_key=api_key, model=model, temperature=0.2)
+    llm = load_openai_driver(api_key=api_key, model=model, temperature=0.2)
 
     # IMPORTANT: Pass viewport as a dict for cross-version safety.
     ctx_cfg = BrowserContextConfig(
@@ -128,9 +157,9 @@ if "history" not in st.session_state:
 
 with st.sidebar:
     st.header("🔌 LLM / Browser Settings")
-    st.caption("Uses the OpenAI driver from browser-use. Provide your API key below.")
+    st.caption("Supply an OpenAI key compatible with your installed browser-use driver.")
     openai_key = st.text_input("OpenAI API Key", type="password")
-    model = st.text_input("Model", value="gpt-4o-mini", help="Any chat model supported by your key.")
+    model = st.text_input("Model", value="gpt-4o-mini", help="Any chat model your driver supports.")
     headless = st.checkbox("Run headless", value=False)
     max_steps = st.slider("Max actions", 10, 300, 120, 10)
     st.caption("Tip: keep headless OFF while debugging; ON for servers.")
@@ -173,6 +202,8 @@ with tab_chat:
                         st.session_state.history.append({"role": "assistant", "content": out})
                     except ValidationError as ve:
                         st.error(f"Invalid profile: {ve}")
+                    except ImportError as ie:
+                        st.error(str(ie))
                     except Exception as e:
                         st.error(str(e))
 
@@ -229,7 +260,6 @@ with tab_batch:
                 out = asyncio.run(run_browser_use(goal, openai_key, model, headless, max_steps))
                 s.update(label="Agent finished", state="complete")
 
-            # Try to render strict JSON if the agent followed instructions
             try:
                 parsed = json.loads(out)
                 st.success("Run complete.")
@@ -240,5 +270,7 @@ with tab_batch:
 
         except ValidationError as ve:
             st.error(f"Invalid input: {ve}")
+        except ImportError as ie:
+            st.error(str(ie))
         except Exception as e:
             st.error(str(e))
