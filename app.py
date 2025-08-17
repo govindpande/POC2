@@ -1,20 +1,34 @@
+# app.py
+# Streamlit + browser-use job application copilot
+# Setup:
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install streamlit browser-use playwright pydantic
+#   python -m playwright install
+# Run:
+#   streamlit run app.py
+
 import asyncio
 import json
 import os
 import re
 from typing import List, Optional
+
 import streamlit as st
 from pydantic import BaseModel, Field, HttpUrl, ValidationError
 
-# ---- browser-use imports (project frequently updates; these names match current public API) ----
-# If your installed version differs, check: pip show browser-use && python -c "import browser_use; print(browser_use.__file__)"
+# ---- browser-use imports (stable across versions) ----
 from browser_use import Agent
-from browser_use.browser.context import BrowserContextConfig
-from browser_use.browser.views import BrowserViewportSize
-from browser_use.controller.service import Controller
 from browser_use.llm.openai import OpenAIChat
+from browser_use.browser.context import BrowserContextConfig
+
+# Controller import path moved across versions; try both.
+try:
+    from browser_use.controller.service import Controller
+except Exception:  # pragma: no cover
+    from browser_use.controller.controller import Controller  # older releases
 
 URL_REGEX = r"(https?://[^\s]+)"
+
 
 # ---------------- Models ----------------
 class Profile(BaseModel):
@@ -29,6 +43,7 @@ class Profile(BaseModel):
     desired_salary: str = ""
     notice_period: str = ""
     resume_url: str = Field(..., description="Public URL to resume (PDF preferred)")
+
 
 class JobBatch(BaseModel):
     job_urls: List[HttpUrl]
@@ -66,11 +81,11 @@ RESUME (public URL):
 {profile.resume_url}
 
 INSTRUCTIONS:
-1) Open each URL and navigate to the application form.
-2) Upload the resume when a file upload is requested (use the provided URL).
-3) Autofill standard fields from the PROFILE.
-4) For free-form questions (e.g., “Why this role?”), write 2–4 concise, professional sentences using info from the profile and page context.
-5) If login/unique questions/captcha blocks progress, stop for that site and record the reason.
+1) Open each URL and go to the application form.
+2) Upload the resume (download the URL to a temp file if the page needs a file picker).
+3) Fill standard fields from the profile.
+4) For free-form questions (e.g., “Why this role?”), write 2–4 concise, professional sentences using profile + page context.
+5) If login/unique questions/captcha block progress, stop for that site and record the reason.
 
 RETURN STRUCTURED OUTPUT ONLY as JSON:
 {{"results": [
@@ -80,30 +95,27 @@ RETURN STRUCTURED OUTPUT ONLY as JSON:
 
 
 async def run_browser_use(goal: str, api_key: str, model: str, headless: bool, max_steps: int):
-    """
-    Spins up a browser-use Agent and executes the goal.
-    Returns the final text output (the agent is instructed to return JSON).
-    """
-    # LLM
+    """Run a browser-use Agent and return its final text output."""
     llm = OpenAIChat(api_key=api_key, model=model, temperature=0.2)
 
-    # Browser config
+    # IMPORTANT: Pass viewport as a dict for cross-version safety.
     ctx_cfg = BrowserContextConfig(
         headless=headless,
-        viewport_size=BrowserViewportSize(width=1400, height=900),
-        # You can add: user_agent, geolocation, cookies, proxy, etc.
+        viewport_size={"width": 1400, "height": 900},
+        # Add optional fields here: user_agent=..., proxy=..., cookies=..., geolocation=...
     )
+
     controller = Controller(context_config=ctx_cfg)
 
     agent = Agent(
         task=goal,
         llm=llm,
         controller=controller,
-        max_actions=max_steps,  # guards runaway loops
+        max_actions=max_steps,  # guard against runaway loops
     )
 
-    result = await agent.run()          # returns an object with .final_result / .final_result_text across versions
-    # Normalize across versions
+    result = await agent.run()
+    # Normalize across versions (.final_result vs .final_result_text)
     text = getattr(result, "final_result", None) or getattr(result, "final_result_text", "") or str(result)
     return text
 
@@ -116,14 +128,15 @@ if "history" not in st.session_state:
 
 with st.sidebar:
     st.header("🔌 LLM / Browser Settings")
-    provider = st.selectbox("Provider", ["OpenAI"], help="This app uses the OpenAI driver from browser-use.")
+    st.caption("Uses the OpenAI driver from browser-use. Provide your API key below.")
     openai_key = st.text_input("OpenAI API Key", type="password")
-    model = st.text_input("Model", value="gpt-4o-mini", help="Any chat model your key supports.")
+    model = st.text_input("Model", value="gpt-4o-mini", help="Any chat model supported by your key.")
     headless = st.checkbox("Run headless", value=False)
     max_steps = st.slider("Max actions", 10, 300, 120, 10)
-    st.caption("Tip: run non-headless while debugging; switch to headless on servers.")
+    st.caption("Tip: keep headless OFF while debugging; ON for servers.")
 
 tab_chat, tab_batch = st.tabs(["💬 Chat", "📥 Batch Apply"])
+
 
 # ---------------- Chat Tab ----------------
 with tab_chat:
@@ -133,7 +146,9 @@ with tab_chat:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
 
-    prompt = st.chat_input("e.g., 'apply to https://jobs.lever.co/... and https://boards.greenhouse.io/...'", disabled=not openai_key)
+    prompt = st.chat_input(
+        "e.g., 'apply to https://jobs.lever.co/... and https://boards.greenhouse.io/...'", disabled=not openai_key
+    )
     if prompt:
         st.session_state.history.append({"role": "user", "content": prompt})
         urls = extract_urls(prompt)
@@ -141,8 +156,7 @@ with tab_chat:
             if not urls:
                 st.write("Please include one or more job URLs in your message.")
             else:
-                # Minimal on-the-fly profile
-                st.info("Using a minimal profile—fill the Batch tab for full control.")
+                st.info("Using a minimal profile—use the Batch tab for full control.")
                 name = st.text_input("Full name", key="chat_name")
                 email = st.text_input("Email", key="chat_email")
                 phone = st.text_input("Phone", key="chat_phone")
@@ -161,6 +175,7 @@ with tab_chat:
                         st.error(f"Invalid profile: {ve}")
                     except Exception as e:
                         st.error(str(e))
+
 
 # ---------------- Batch Tab ----------------
 with tab_batch:
@@ -214,7 +229,7 @@ with tab_batch:
                 out = asyncio.run(run_browser_use(goal, openai_key, model, headless, max_steps))
                 s.update(label="Agent finished", state="complete")
 
-            # Try to render structured JSON if the agent followed instructions
+            # Try to render strict JSON if the agent followed instructions
             try:
                 parsed = json.loads(out)
                 st.success("Run complete.")
