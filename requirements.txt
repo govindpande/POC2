@@ -1,5 +1,4 @@
-pydantic
-skyvern
 streamlit
-openssl
-libssl3
+browser-use
+playwright
+pydantic
